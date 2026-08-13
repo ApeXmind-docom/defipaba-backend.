@@ -6,6 +6,25 @@ import { startAllLines } from "./whatsapp/client.js";
 import { handleMessage } from "./whatsapp/handler.js";
 import { log } from "./util/log.js";
 
+/**
+ * Sin esto, un tropiezo de red dentro de Baileys —por ejemplo un timeout al
+ * inicializar una línea, que ya se ha visto en producción— tumba TODO el
+ * proceso: el panel, la agenda, la otra línea si la hubiera, todo. Render
+ * lo reinicia solo, pero tarda varios minutos, mucho más que los 4 segundos
+ * que ya tiene programados el reintento interno de cada línea.
+ *
+ * Con esto en cambio, el error queda registrado en los logs pero el
+ * servicio sigue de pie; la línea afectada se reconecta sola por su propia
+ * lógica, sin arrastrar a las demás piezas del sistema con ella.
+ */
+process.on("unhandledRejection", (error) => {
+  log.error({ error }, "Promesa rechazada sin capturar — el servicio sigue de pie");
+});
+
+process.on("uncaughtException", (error) => {
+  log.error({ error }, "Excepcion sin capturar — el servicio sigue de pie");
+});
+
 async function main(): Promise<void> {
   const lines = config.whatsapp.lines;
 
