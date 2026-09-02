@@ -26,6 +26,23 @@ export type MessageHandler = (
 /** Baileys es muy verboso; su logger va aparte del nuestro. */
 const baileysLogger = pino({ level: "warn" });
 
+/**
+ * Cuanto tiempo sin ninguna señal de vida de una línea (ni conexión, ni
+ * mensaje) antes de asumir que el socket quedó en un estado "zombi" — vivo
+ * a los ojos de Baileys pero sin recibir nada realmente — y forzar una
+ * reconexión desde cero. Ya pasó en producción: el keep-alive interno de
+ * Baileys dejó de dispararse tras un timeout en sus consultas de inicio, la
+ * línea quedó "conectada" para siempre sin procesar un solo mensaje más.
+ */
+const WATCHDOG_STALE_MS = 90_000;
+const WATCHDOG_CHECK_MS = 30_000;
+
+const lastActivity = new Map<string, number>();
+
+function touch(number: string): void {
+  lastActivity.set(number, Date.now());
+}
+
 function extractText(message: Record<string, unknown> | null | undefined): string | null {
   if (!message) return null;
   const m = message as {
@@ -56,7 +73,11 @@ function extractText(message: Record<string, unknown> | null | undefined): strin
  * limitación nuestra — pero todas invocan el mismo `onMessage`, que es donde
  * vive el cerebro compartido (Claude, la base de leads, el calendario).
  */
-export async function startLine(line: WhatsAppLine, onMessage: MessageHandler): Promise<WASocket> {
+export async function startLine(
+  line: WhatsAppLine,
+  onMessage: MessageHandler,
+  onSocketReady?: (sock: WASocket) => void,
+): Promise<WASocket> {
   mkdirSync(line.sessionDir, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(line.sessionDir);
@@ -70,11 +91,20 @@ export async function startLine(line: WhatsAppLine, onMessage: MessageHandler): 
     markOnlineOnConnect: false,
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
+    /* Esta consulta de inicio ya causó un timeout ("unexpected error in
+     * 'init queries'") en producción sin aportar nada que este bot use
+     * (no necesitamos privacidad, bloqueos ni sincronizar chats). Se
+     * desactiva para no ensuciar los logs con un error inofensivo. */
+    fireInitQueries: false,
   });
+
+  touch(line.number);
+  onSocketReady?.(sock);
 
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", (update) => {
+    touch(line.number);
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -112,7 +142,7 @@ export async function startLine(line: WhatsAppLine, onMessage: MessageHandler): 
 
       /* Reconexion con espera: reintentar en bucle cerrado es otra senal de bot. */
       setTimeout(() => {
-        startLine(line, onMessage).catch((error) =>
+        startLine(line, onMessage, onSocketReady).catch((error) =>
           log.error({ error, line: line.name }, "Fallo al reconectar"),
         );
       }, 4000);
@@ -120,6 +150,7 @@ export async function startLine(line: WhatsAppLine, onMessage: MessageHandler): 
   });
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    touch(line.number);
     if (type !== "notify") return;
 
     for (const message of messages) {
@@ -168,11 +199,38 @@ export async function startAllLines(
   const sockets = new Map<string, WASocket>();
 
   await Promise.all(
-    lines.map(async (line) => {
-      const sock = await startLine(line, onMessage);
-      sockets.set(line.number, sock);
-    }),
+    lines.map((line) =>
+      startLine(line, onMessage, (sock) => sockets.set(line.number, sock)),
+    ),
   );
+
+  /* Guardia contra el socket "zombi": Baileys puede quedar marcado como
+   * conectado para siempre sin que llegue un solo evento mas, sin disparar
+   * "connection.update" con close (ya paso en produccion, ver comentario en
+   * index.ts). Si una linea lleva demasiado sin ninguna senal de vida, se
+   * fuerza una reconexion completa en vez de esperar a que Baileys se de
+   * cuenta solo. */
+  for (const line of lines) {
+    setInterval(() => {
+      const last = lastActivity.get(line.number) ?? Date.now();
+      if (Date.now() - last <= WATCHDOG_STALE_MS) return;
+
+      log.warn({ line: line.name }, "Sin actividad — forzando reconexion (watchdog)");
+      touch(line.number); // evita disparar de nuevo mientras reconecta
+
+      const stale = sockets.get(line.number);
+      try {
+        stale?.end(new Error("watchdog: sin actividad"));
+      } catch {
+        /* El socket ya podia estar en un estado inconsistente; no importa,
+         * de todas formas se reemplaza a continuacion. */
+      }
+
+      startLine(line, onMessage, (sock) => sockets.set(line.number, sock)).catch((error) =>
+        log.error({ error, line: line.name }, "Fallo al reconectar (watchdog)"),
+      );
+    }, WATCHDOG_CHECK_MS);
+  }
 
   return sockets;
 }
